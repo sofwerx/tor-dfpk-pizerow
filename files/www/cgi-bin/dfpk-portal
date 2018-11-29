@@ -1,0 +1,169 @@
+#!/usr/bin/lua
+
+local sys = require "luci.sys"
+local utl = require "luci.util"
+local uci = require "luci.model.uci".cursor()
+local os  = require "os"
+local http = require "socket.http"
+local ltn12 = require "ltn12"
+local json = require "luci.jsonc"
+
+function dump(o)
+   if type(o) == 'table' then
+      local s = '{ '
+      for k,v in pairs(o) do
+         if type(k) ~= 'number' then k = '"'..k..'"' end
+         s = s .. '['..k..'] = ' .. dump(v) .. ','
+      end
+      return s .. '} '
+   else
+      return tostring(o)
+   end
+end
+
+function urldecode(s)
+  s = s:gsub('+', ' ')
+       :gsub('%%(%x%x)', function(h)
+                           return string.char(tonumber(h, 16))
+                         end)
+  return s
+end
+
+function query_string_vars(query_string)
+    local vars = {}
+
+    for k, v in string.gmatch(query_string, "(%w+)=([^&]+)") do
+        vars[k] = urldecode(v)
+    end
+
+    return vars
+end
+
+local b='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+function base64_enc(data)
+    return ((data:gsub('.', function(x)
+        local r,b='',x:byte()
+        for i=8,1,-1 do r=r..(b%2^i-b%2^(i-1)>0 and '1' or '0') end
+        return r;
+    end)..'0000'):gsub('%d%d%d?%d?%d?%d?', function(x)
+        if (#x < 6) then return '' end
+        local c=0
+        for i=1,6 do c=c+(x:sub(i,i)=='1' and 2^(6-i) or 0) end
+        return b:sub(c+1,c+1)
+    end)..({ '', '==', '=' })[#data%3+1])
+end
+
+function show_connection_form()
+    print("<h2>Connect to private network</h2>")
+    print("<form target=\"./\" method=\"post\">")
+    print("<p>URL:</p>")
+    print("<input type=\"text\" name=\"url\">")
+    print("<p>Username:</p>")
+    print("<input type=\"text\" name=\"username\">")
+    print("<p>Password:</p>")
+    print("<input type=\"password\" name=\"password\">")
+    print("<input type=\"submit\" value=\"Connect\">")
+    print("</form>")
+end
+
+function handle_connection(post_vars)
+    local url = post_vars.url
+    local username = post_vars.username
+    local password = post_vars.password
+
+    local protocol = 'http://'
+
+    if url:sub(1, #protocol) ~= protocol then
+        url = protocol .. url
+    end
+
+    local base64_user_password = base64_enc(username .. ':' .. password)
+
+    local headers = {
+        Authorization = string.format('Basic %s', base64_user_password)
+    }
+
+    local t = {}
+
+    local status, code, headers = http.request {
+        url = url,
+        headers = headers,
+        sink = ltn12.sink.table(t)
+    }
+
+    if status ~= nil and code == 200 then
+        local json_string = table.concat(t)
+        local jt = json.parse(json_string)
+        local das = jt.DirAuthorities
+        local dir_auth_string = ""
+        for i, da in ipairs(das) do
+            dir_auth_string = dir_auth_string ..
+                string.format('DirAuthority %s orport=%d v3ident=%s %s %s:%d %s\n',
+                    da.nickname,
+                    da.orport,
+                    da.v3ident,
+                    da.flags,
+                    da.ip,
+                    da.port,
+                    da.fingerprint)
+        end
+
+        local socks_port_string = string.format("SocksPort %s\n", jt.SocksPort)
+        local use_bridges_string = string.format("UseBridges %d\n", jt.UseBridges)
+
+        local ctp = jt.ClientTransportPlugin
+        local client_transport_string = string.format('ClientTransportPlugin %s exec %s %s\n',
+            ctp.transport,
+            ctp.binary,
+            ctp.options)
+
+        local bridge = jt.Bridge
+        local bridge_string = string.format("Bridge %s %s:%d\n", bridge.transport, bridge.ip, bridge.orport)
+
+        local torrc =
+            dir_auth_string ..
+            socks_port_string ..
+            use_bridges_string ..
+            client_transport_string ..
+            bridge_string
+
+        dfpk_torrc_file = io.open('/etc/config/dfpk-torrc', 'w')
+
+        if dfpk_torrc_file ~= nil then
+            dfpk_torrc_file:write(torrc)
+
+            -- The daemon is setup to read the custom config file if it exists, so
+            -- restarting will load the custom config
+            os.execute('/etc/init.d/tor restart')
+
+            print("Connection successful.")
+        else
+            print("Failed to update the tor configuration.")
+        end
+    else
+        print("<h2>Failed to connect, make sure the credentials are correct and try again.</h2>")
+        show_connection_form()
+    end
+end
+
+io.write("Status: 200 OK\r\n")
+io.write("Content-Type: text/html\r\n\r\n")
+
+print("<html>")
+print("<body>")
+
+local post_length = tonumber(os.getenv('CONTENT_LENGTH'))
+
+if post_length ~= nil and post_length > 0 then
+    local POST = io.read(post_length)
+    local post_vars = query_string_vars(POST)
+    print(dump(post_vars))
+    handle_connection(post_vars)
+else
+    show_connection_form()
+end
+
+print("</body>")
+print("</html>")
+
+

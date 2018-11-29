@@ -2,7 +2,7 @@
 
 local sys = require "luci.sys"
 local utl = require "luci.util"
-local uci  = require "luci.model.uci".cursor()
+local uci = require "luci.model.uci".cursor()
 local nw = require "luci.model.network".init(uci)
 local os = require "os"
 local io = require "io"
@@ -85,7 +85,7 @@ end
 
 function ssid_password_page(ssid, bssid)
     print("<p>Please enter the password for " .. ssid .. "</p>")
-    print("<form action=\"./dfpk-portal\" method=\"post\">")
+    print("<form action=\"./dfpk-wifi\" method=\"post\">")
     print("<input type=\"hidden\" name=\"ssid\" value=\"" .. ssid .. "\"></input>")
     print("<input type=\"hidden\" name=\"bssid\" value=\"" .. bssid .. "\"></input>")
     print("<input type=\"password\" name=\"key\"></input>")
