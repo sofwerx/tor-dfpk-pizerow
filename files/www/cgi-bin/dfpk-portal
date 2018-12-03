@@ -186,9 +186,6 @@ if post_length ~= nil and post_length > 0 then
     local post_vars = query_string_vars(POST)
     handle_connection(post_vars)
 else
-    local dfpk_torrc = io.open(DFPK_TORRC_FILENAME, 'r')
-    local already_on_dfpk = false
-
     local GET = os.getenv('QUERY_STRING')
     local get_vars = {}
 
@@ -198,8 +195,8 @@ else
 
     local disconnect = get_vars.disconnect or false
 
+    local dfpk_torrc = io.open(DFPK_TORRC_FILENAME, 'r')
     if dfpk_torrc ~= nil then
-        already_on_dfpk = true
         if not disconnect then
             show_already_connected()
         else
