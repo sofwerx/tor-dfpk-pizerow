@@ -1,0 +1,213 @@
+#!/usr/bin/lua
+
+local sys = require "luci.sys"
+local utl = require "luci.util"
+local uci = require "luci.model.uci".cursor()
+local os  = require "os"
+local http = require "socket.http"
+local ltn12 = require "ltn12"
+local json = require "luci.jsonc"
+
+local DFPK_TORRC_FILENAME = '/etc/config/dfpk-torrc'
+
+function dump(o)
+   if type(o) == 'table' then
+      local s = '{ '
+      for k,v in pairs(o) do
+         if type(k) ~= 'number' then k = '"'..k..'"' end
+         s = s .. '['..k..'] = ' .. dump(v) .. ','
+      end
+      return s .. '} '
+   else
+      return tostring(o)
+   end
+end
+
+function urldecode(s)
+  s = s:gsub('+', ' ')
+       :gsub('%%(%x%x)', function(h)
+                           return string.char(tonumber(h, 16))
+                         end)
+  return s
+end
+
+function query_string_vars(query_string)
+    local vars = {}
+
+    for k, v in string.gmatch(query_string, "(%w+)=([^&]+)") do
+        vars[k] = urldecode(v)
+    end
+
+    return vars
+end
+
+local b='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+function base64_enc(data)
+    return ((data:gsub('.', function(x)
+        local r,b='',x:byte()
+        for i=8,1,-1 do r=r..(b%2^i-b%2^(i-1)>0 and '1' or '0') end
+        return r;
+    end)..'0000'):gsub('%d%d%d?%d?%d?%d?', function(x)
+        if (#x < 6) then return '' end
+        local c=0
+        for i=1,6 do c=c+(x:sub(i,i)=='1' and 2^(6-i) or 0) end
+        return b:sub(c+1,c+1)
+    end)..({ '', '==', '=' })[#data%3+1])
+end
+
+function restart_tor()
+    os.execute('/etc/init.d/tor restart')
+end
+
+function show_already_connected()
+    print("<h2>Connected to the DFPK.</h2>")
+    print('<a href="?disconnect=true">Click here to disconnect.</a>')
+end
+
+function disconnect_dfpk()
+    -- To disconnect we can simply remove the custom config and restart tor.
+    os.remove(DFPK_TORRC_FILENAME)
+    restart_tor()
+    print("<h2>You have been disconnected from the DFPK</h2>")
+    show_connection_form()
+end
+
+function show_connection_form()
+    print("<h2>Connect to private network</h2>")
+    print("<form target=\"./\" method=\"post\">")
+    print("<p>URL:</p>")
+    print("<input type=\"text\" name=\"url\">")
+    print("<p>Username:</p>")
+    print("<input type=\"text\" name=\"username\">")
+    print("<p>Password:</p>")
+    print("<input type=\"password\" name=\"password\">")
+    print("<input type=\"submit\" value=\"Connect\">")
+    print("</form>")
+end
+
+function handle_connection(post_vars)
+    local url = post_vars.url or ""
+    local username = post_vars.username or ""
+    local password = post_vars.password or ""
+
+    local is_onion = false
+
+    if string.find(url, '.onion') then
+        is_onion = true
+    end
+
+    local base64_user_password = base64_enc(username .. ':' .. password)
+    local auth_header = string.format("Authorization: Basic %s", base64_user_password)
+
+    local curl_socks_flag
+    if is_onion then
+        curl_socks_flag = '--socks5-hostname 127.0.0.1:9050'
+    else
+        curl_socks_flag = ''
+    end
+
+    -- Request the hidden service over socks5 through curl.
+    local curl_command = string.format('curl --header "%s" %s %s', auth_header, curl_socks_flag, url)
+    local curl_handle = io.popen(curl_command)
+    local response = curl_handle:read("*a")
+    local rc = {curl_handle:close()}
+
+    if rc ~= nil and rc[1] == true then
+        local jt = json.parse(response)
+
+        if jt == nil then
+            print("<h2>Failed to load tor configuration. Make sure the URL and credentials are correct and try again.</h2>")
+            show_connection_form()
+            return
+        end
+
+        local das = jt.DirAuthorities
+        local dir_auth_string = ""
+        for i, da in ipairs(das) do
+            dir_auth_string = dir_auth_string ..
+                string.format('DirAuthority %s orport=%d v3ident=%s %s %s:%d %s\n',
+                    da.nickname,
+                    da.orport,
+                    da.v3ident,
+                    da.flags,
+                    da.ip,
+                    da.port,
+                    da.fingerprint)
+        end
+
+        local socks_port_string = string.format("SocksPort %s\n", jt.SocksPort)
+        local use_bridges_string = string.format("UseBridges %d\n", jt.UseBridges)
+
+        local ctp = jt.ClientTransportPlugin
+        local client_transport_string = string.format('ClientTransportPlugin %s exec %s %s\n',
+            ctp.transport,
+            ctp.binary,
+            ctp.options)
+
+        local bridge = jt.Bridge
+        local bridge_string = string.format("Bridge %s %s:%d\n", bridge.transport, bridge.ip, bridge.orport)
+
+        local torrc =
+            dir_auth_string ..
+            socks_port_string ..
+            use_bridges_string ..
+            client_transport_string ..
+            bridge_string
+
+        dfpk_torrc_file = io.open(DFPK_TORRC_FILENAME, 'w')
+
+        if dfpk_torrc_file ~= nil then
+            dfpk_torrc_file:write(torrc)
+
+            -- The daemon is setup to read the custom config file if it exists, so
+            -- restarting will load the custom config
+            restart_tor()
+
+            show_already_connected()
+        else
+            print("Failed to update the tor configuration.")
+        end
+    else
+        print("<h2>Failed to connect reason: " .. code .. ".<br> Make sure the URL and credentials are correct and try again.</h2>")
+        show_connection_form()
+    end
+end
+
+io.write("Status: 200 OK\r\n")
+io.write("Content-Type: text/html\r\n\r\n")
+
+print("<html>")
+print("<body>")
+
+local post_length = tonumber(os.getenv('CONTENT_LENGTH'))
+
+if post_length ~= nil and post_length > 0 then
+    local POST = io.read(post_length)
+    local post_vars = query_string_vars(POST)
+    handle_connection(post_vars)
+else
+    local GET = os.getenv('QUERY_STRING')
+    local get_vars = {}
+
+    if GET ~= nil and string.len(GET) > 0 then
+        get_vars = query_string_vars(GET)
+    end
+
+    local disconnect = get_vars.disconnect or false
+
+    local dfpk_torrc = io.open(DFPK_TORRC_FILENAME, 'r')
+    if dfpk_torrc ~= nil then
+        if not disconnect then
+            show_already_connected()
+        else
+            disconnect_dfpk()
+        end
+    else
+        show_connection_form()
+    end
+end
+
+print("</body>")
+print("</html>")
+
+

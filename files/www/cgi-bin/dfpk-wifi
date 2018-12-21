@@ -1,0 +1,169 @@
+#!/usr/bin/lua
+
+local sys = require "luci.sys"
+local utl = require "luci.util"
+local uci = require "luci.model.uci".cursor()
+local nw = require "luci.model.network".init(uci)
+local os = require "os"
+local io = require "io"
+
+local dev = "radio0"
+local iw = luci.sys.wifi.getiwinfo(dev)
+
+function dump(o)
+   if type(o) == 'table' then
+      local s = '{ '
+      for k,v in pairs(o) do
+         if type(k) ~= 'number' then k = '"'..k..'"' end
+         s = s .. '['..k..'] = ' .. dump(v) .. ','
+      end
+      return s .. '} '
+   else
+      return tostring(o)
+   end
+end
+
+function scanlist(times)
+    local i, k, v
+    local l = { }
+    local s = { }
+
+    for i = 1, times do
+        for k, v in ipairs(iw.scanlist or { }) do
+            if not s[v.bssid] then
+                l[#l+1] = v
+                s[v.bssid] = true
+            end
+        end
+    end
+
+    return l
+end
+
+function query_string_bssid()
+    local query_string = os.getenv("QUERY_STRING")
+    if query_string then
+        return string.match(query_string, "(%w+)=([^&]+)")
+    else
+        return nil
+    end
+end
+
+function urldecode(s)
+  s = s:gsub('+', ' ')
+       :gsub('%%(%x%x)', function(h)
+                           return string.char(tonumber(h, 16))
+                         end)
+  return s
+end
+
+function query_string_vars(query_string)
+    local vars = {}
+
+    for k, v in string.gmatch(query_string, "(%w+)=([^&]+)") do
+        vars[k] = urldecode(v)
+    end
+
+    return vars
+end
+
+function home_page()
+    print("<h2>Welcome to the DFPK</h2>")
+
+    local stations = scanlist(1)
+
+    print("<p>Please choose a wifi access point:</p>")
+
+    for k, station in ipairs(stations) do
+        ssid = station.ssid
+        bssid = station.bssid
+        print("<div>")
+        print("<a href=\"?bssid=" .. bssid .. "&ssid=" .. ssid .. "\">" .. station.ssid .. "</a>")
+        print("</div>")
+    end
+end
+
+function ssid_password_page(ssid, bssid)
+    print("<p>Please enter the password for " .. ssid .. "</p>")
+    print("<form action=\"./dfpk-wifi\" method=\"post\">")
+    print("<input type=\"hidden\" name=\"ssid\" value=\"" .. ssid .. "\"></input>")
+    print("<input type=\"hidden\" name=\"bssid\" value=\"" .. bssid .. "\"></input>")
+    print("<input type=\"password\" name=\"key\"></input>")
+    print("<input type=\"submit\" value=\"Connect\"></input>")
+    print("</form>")
+end
+
+function connect_wifi(ssid, bssid, password)
+    local wdev = nw:get_wifidev(dev)
+
+    -- the wifi interface has to be attached to a network
+    local net = nw:add_network('dfpk_wwan', { proto = "dhcp" })
+
+    -- TODO: some of these values are hardcoded, not sure how to properly get them
+    -- for the time being.
+    wifi_conf = {
+        ssid = ssid,
+        network = 'dfpk_wwan',
+        encryption = 'psk2',
+        device = 'radio0',
+        mode = 'sta',
+        bssid = bssid,
+        key = password,
+    }
+
+    local wnet = wdev:add_wifinet(wifi_conf)
+
+    if not wnet then
+        print("Failed to add wifi interface")
+    end
+
+    local changes = uci:changes()
+
+    -- Save our new configuration
+    uci:save("wireless")
+    uci:save("network")
+
+    -- Reloads the wireless configuration
+    luci.sys.call("env -i /sbin/ifup dfpk_wwan >/dev/null 2>/dev/null")
+
+    -- FIXME: There's almost certainly a better way to check if the connection
+    -- was successful...
+    os.execute('sleep 2')
+    local ping_status = luci.sys.call("ping 8.8.8.8 -c 2 >/dev/null")
+    if ping_status == 0 then
+        print("Connection successful!")
+        print("<a href=\"./dfpk-portal\">Click here to access the portal</a>")
+    else
+        print("Failed to connect to wifi station " .. ssid)
+    end
+end
+
+local post_length = tonumber(os.getenv('CONTENT_LENGTH'))
+
+io.write("Status: 200 OK\r\n")
+io.write("Content-Type: text/html\r\n\r\n")
+
+print("<html>")
+
+print("<body>")
+
+if post_length ~= nil and post_length > 0 then
+    local POST = io.read(post_length)
+    local post_vars = query_string_vars(POST)
+    connect_wifi(post_vars.ssid, post_vars.bssid, post_vars.key)
+else
+    local GET = os.getenv('QUERY_STRING')
+
+    if GET ~= nil and string.len(GET) > 0 then
+        local get_vars = query_string_vars(GET)
+        ssid_password_page(get_vars.ssid, get_vars.bssid)
+    else
+        home_page()
+    end
+
+end
+
+print("</body>")
+
+print("</html>")
+
